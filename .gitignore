@@ -2,5 +2,5 @@
 *.log
 *.tmp
 
-#Ignore Photo Dataset
+#Ignore Dataset
 Dataset/*
