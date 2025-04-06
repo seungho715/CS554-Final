@@ -3,4 +3,4 @@
 *.tmp
 
 #Ignore Photo Dataset
-Dataset/
+Dataset/*
