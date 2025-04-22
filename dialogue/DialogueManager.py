@@ -1,9 +1,13 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import json
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
-ACTUAL_TOKEN = "CS554-Token" #User token name
+ACTUAL_TOKEN =  os.getenv("HF_AUTH_TOKEN")#User token name
 
 class DialogueManager:
     def __init__(self, model_name="meta-llama/Llama-3.2-1B-Instruct", device="cuda" if torch.cuda.is_available() else "cpu"):
@@ -31,10 +35,10 @@ class DialogueManager:
     
     def build_prompt(self, conversation_history):
         prompt = (
-            "You are a conversational assistant that extracts the user intent and key details "
-            "from the conversation. Given the conversation history, output a JSON with keys "
-            "'intent', 'location', 'cuisine', 'price_range', and 'other_info'.\n\n"
-            "Conversation:\n" + conversation_history + "\n\nOutput JSON:"
+        "You are a conversational assistant that extracts user intent and details from the conversation. "
+        "Given the conversation history, output a JSON with the following keys: "
+        "'intent', 'location', 'cuisine', 'price_range', 'recent_review_requested' (True/False), and 'other_info'.\n\n"
+        "Conversation:\n" + conversation_history + "\n\nOutput JSON:"
         )
         return prompt
     
