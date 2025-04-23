@@ -36,10 +36,15 @@ class DialogueManager:
     def build_prompt(self, conversation_history):
         prompt = (
         "You are a conversational assistant that extracts user intent and details from the conversation. "
-        "Given the conversation history, output a JSON with the following keys: "
-        "'intent', 'location', 'cuisine', 'price_range', 'recent_review_requested' (True/False), and 'other_info'.\n\n"
-        "Conversation:\n" + conversation_history + "\n\nOutput JSON:"
-        )
+        "Given the conversation history, output a JSON with the following keys:\n"
+        "  • intent\n"
+        "  • location\n"
+        "  • cuisine  (in singular form, e.g. 'taco' not 'tacos')\n"
+        "  • price_range\n"
+        "  • recent_review_requested  (True/False)\n"
+        "  • other_info\n\n"
+         "Conversation:\n" + conversation_history + "\n\nOutput JSON:"
+         )
         return prompt
     
     def process_conversation(self, conversation_history, max_new_tokens=150):
