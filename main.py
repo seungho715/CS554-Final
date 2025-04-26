@@ -6,6 +6,7 @@ from ranker.Ranker import Ranker
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy     import create_engine
 from etl_business   import Business, DATABASE_URL
+import os
 
 def clean_cuisine(text: str) -> str:
     t = text.strip().lower()
@@ -41,20 +42,27 @@ def main():
         if user.lower().startswith(("quit", "exit", "thanks")):
             print("Assistant: Happy dining!")
             break
-
-        # always append to history
-        history += f"User: {user}\n"
+        
+        #1) Image Classified
+        if os.path.isfile(user) and user.lower().endswith((".jpg",".png")):
+            #Classify Image and Prediction
+            continue
 
         # 2) If we're waiting for a follow-up, consume that slot and go next turn
         if awaiting_slot == "cuisine":
             slots["cuisine"] = clean_cuisine(user)
             awaiting_slot = None
+            history += f"User: {user}\n"
             continue
 
         if awaiting_slot == "location":
             slots["location"] = user.strip().title()
             awaiting_slot = None
+            history += f"User: {user}\n"
             continue
+        
+        # always append to history
+        history += f"User: {user}\n"
 
         # 3) Quick keyword fallback for cuisine before LLM
         if not slots.get("cuisine"):
@@ -72,9 +80,8 @@ def main():
                 slots[k] = new_slots[k]
 
         # 5) If user said "review" and we have both cuisine+location, set flag
-        if slots.get("cuisine") and slots.get("location"):
-            if "review" in user.lower():
-                slots["recent_review_requested"] = True
+        if slots.get("cuisine") and slots.get("location") and "review" in user.lower():
+            slots["recent_review_requested"] = True
 
         # 6) Clarify missing cuisine
         if not slots.get("cuisine"):
