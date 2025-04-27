@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Restaurant Recommender</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Restaurant Recommender</h1>
+        
+        <form action="/get_recommendations" method="POST" enctype="multipart/form-data">
+            <input type="text" name="user_input" placeholder="Enter your cuisine and location..." required>
+            <br><br>
+            <label for="image_upload">Attach an image (optional):</label>
+            <input type="file" name="image_upload" id="image_upload" accept="image/*">
+            <br><br>
+            <button type="submit">Get Recommendations</button>
+        </form>
+        
+        {% if recommendations %}
+        <h2>Recommendations for "{{ user_input }}"</h2>
+        <ul>
+            {% for recommendation in recommendations %}
+            <li>
+                <strong>{{ recommendation['name'] }}</strong><br>
+                {{ recommendation['address'] }}, {{ recommendation['city'] }}<br>
+                Score: {{ recommendation['score'] }}<br>
+                {% if recommendation['review'] %}
+                    <i>Recent Review:</i> {{ recommendation['review'] }}
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+        
+        {% if error %}
+        <p style="color: red;">{{ error }}</p>
+        {% endif %}
+    </div>
+</body>
+</html>
