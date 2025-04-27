@@ -144,7 +144,7 @@ def simulate_query_flow(user_query, dm, rec_engine, ranker, all_cuisines):
 
     return top_recommendations
 
-def main_evaluation():
+def evaluation():
 ##MODEL SETUP
     dm = DialogueManager()
     rec_engine = RecommendationEngine()
@@ -229,5 +229,5 @@ def main_evaluation():
     session.close()
 
 ##if __name__ == "__main__":
-  ##  main_evaluation()
+  ##  evaluation()
 
