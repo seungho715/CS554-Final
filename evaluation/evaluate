@@ -1,1 +1,233 @@
+from bert_score import score
+from main import main
+from recommendation.RecommendationEngine import RecommendationEngine
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import pandas as pd
+import os
+from dotenv import load_dotenv
+from huggingface_hub import login
+import random
+import numpy as np
+from sklearn.metrics import ndcg_score
+from dialogue.DialogueManager import DialogueManager
+from recommendation.RecommendationEngine import RecommendationEngine
+from recommendation.ReviewRetrieval import ReviewRetrieval
+from ranker.Ranker import Ranker
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine
+from etl_business import Business, DATABASE_URL
+from nltk.translate.bleu_score import sentence_bleu
+from rouge_score import rouge_scorer
+
+load_dotenv()  
+database_url = os.getenv('DATABASE_URL')
+huggingface_token = os.getenv('HUGGINGFACE_TOKEN')
+
+login(token=huggingface_token)
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype="float16",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4"
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-7b-chat-hf",
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True,
+    offload_folder="offload")
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "meta-llama/Llama-2-7b-chat-hf",
+    use_fast=False,
+    trust_remote_code=True
+)
+
+def llama2_real_response(query, tokenizer, model, max_new_tokens=128):
+    """Query LLaMA 2 7B for restaurant recommendations."""
+    system_prompt = (
+        "You are a helpful restaurant recommendation assistant. "
+        "Given a user request, suggest 3 specific restaurant names. "
+        "List the restaurants separated by commas."
+    )
+    full_prompt = f"[INST] {system_prompt}\nUser: {query} [/INST]"
+
+    inputs = tokenizer(full_prompt, return_tensors="pt").to(model.device)
+    output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True, top_p=0.95, temperature=0.7)
+
+    decoded = tokenizer.decode(output[0], skip_special_tokens=True)
+
+    response_text = decoded.split('[/INST]')[-1].strip()
+    recommended = [x.strip() for x in response_text.split(",") if x.strip()]
+
+    return recommended[:3]
+
+def clean_cuisine(text: str) -> str:
+    t = text.strip().lower()
+    return t[:-1] if t.endswith("s") and len(t) > 1 else t
+
+def calculate_recall_at_k(predictions, gold, k):
+    hits = sum(1 for pred in predictions[:k] if pred in gold)
+    return hits / min(k, len(gold)) if gold else 0
+
+def calculate_precision_at_k(predictions, gold, k):
+    hits = sum(1 for pred in predictions[:k] if pred in gold)
+    return hits / k
+
+def calculate_ndcg_at_k(predictions, gold, k):
+    true_relevance = [1 if item in gold else 0 for item in predictions[:k]]
+    if not any(true_relevance):
+        return 0.0
+    return ndcg_score([true_relevance], [sorted(true_relevance, reverse=True)])
+
+def calculate_bleu_score(reference, hypothesis):
+    """Calculate BLEU score between two lists."""
+    reference = gold_standard[query]
+    return sentence_bleu([reference], hypothesis)
+
+def calculate_rouge_score(reference, hypothesis):
+    """Calculate ROUGE-L score."""
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    reference = gold_standard[query]
+    scores = scorer.score(" ".join(reference), " ".join(hypothesis))
+    return scores['rougeL'].fmeasure
+
+def simulate_query_flow(user_query, dm, rec_engine, ranker, all_cuisines):
+    """Simulate full main() flow for a user query."""
+    history = f"User: {user_query}\n"
+    slots = {}
+    awaiting_slot = None
+
+    # 1. Keyword fallback for cuisine
+    if not slots.get("cuisine"):
+        for c in all_cuisines:
+            if c in user_query.lower():
+                slots["cuisine"] = c
+                break
+
+    # 2. LLM slot filling
+    new_slots = dm.process_conversation(history)
+    if new_slots.get("cuisine") is not None:
+        new_slots["cuisine"] = clean_cuisine(new_slots["cuisine"])
+    for k in ("cuisine", "location", "recent_review_requested", "other_info"):
+        if new_slots.get(k) is not None:
+            slots[k] = new_slots[k]
+
+    # 3. Skip if missing info
+    if not slots.get("cuisine") or not slots.get("location"):
+        return None
+
+    # 4. Perform recommendation + reranking
+    query = f"{slots['cuisine']} restaurants in {slots['location']}"
+    raw = rec_engine.search(query)
+    cands = [
+        {
+            "business_id": b.business_id,
+            "name": b.name,
+            "address": b.address,
+            "city": b.city,
+            "state": b.state,
+            "categories": b.categories,
+            "stars": b.stars
+        }
+        for b in raw
+    ]
+    ranked = ranker.rerank(query, candidates=cands)
+
+    if not ranked:
+        return None
+
+    top_recommendations = [r['name'] for r in ranked[:3]]
+
+    return top_recommendations
+
+def main_evaluation():
+##MODEL SETUP
+    dm = DialogueManager()
+    rec_engine = RecommendationEngine()
+    ranker = Ranker()
+    rr = ReviewRetrieval()
+
+    db_engine = create_engine(DATABASE_URL)
+    Session = sessionmaker(bind=db_engine)
+    session = Session()
+
+    rows = session.query(Business.categories).distinct().all()
+    all_cuisines = set()
+    for (cats,) in rows:
+        if not cats:
+            continue
+        for c in cats.split(","):
+            c = c.strip().lower()
+            if c.endswith("s"):
+                c = c[:-1]
+            all_cuisines.add(c)
+
+##QUERY GENERATION, add query generator?
+    queries = [
+        "Find me a sushi restaurant in Worcester",
+        "Best Italian food in the North End of Boston",
+        "Good coffee with seating and wifi in Worcester",
+        "Vegan brunch places in Boston",
+        "Free karaoke in Worcester"
+        ]
+
+    gold_standard = {
+        "Find me a sushi restaurant in Worcester": ['Baba Sushi', 'The Sole Proprietor', 'Kenichi Bistro', 'Sushi Miyazawa'],
+        "Best Italian food in the North End of Boston": ['Mamma Maria', 'Bricco', 'Trattoria Il Panino'],
+        "Good coffee with seating and wifi in Worcester": ['InHouse Coffee', 'Acoustic Java', 'Birchtree Bread Company'],
+        "Vegan brunch places in Boston": ['Cocobeet', 'Whole Heart Provisions', 'Life Alive Organic Cafe'],
+        "Free karaoke in Worcester": ['KTV Karaoke Club', 'Electric Haze', 'Nick’s Bar and Restaurant'],
+    }
+
+    results = []
+##EVAL
+    for query in queries:
+        print(f"\nEvaluating Query: '{query}'")
+
+        model_results = simulate_query_flow(query, dm, rec_engine, ranker, all_cuisines)
+        llama2_results = llama2_real_response(query)
+
+        if model_results is None:
+            print(f"Skipping '{query}' — missing information from your system.")
+            continue
+
+        reference = [x.lower().strip() for x in gold_standard[query]]
+        model_results_clean = [x.lower().strip() for x in model_results]
+        llama2_results_clean = [x.lower().strip() for x in llama2_results]
+
+        bleu_model = calculate_bleu_score(reference, model_results_clean)
+        rouge_model = calculate_rouge_score(reference, model_results_clean)
+
+        bleu_llama = calculate_bleu_score(reference, llama2_results_clean)
+        rouge_llama = calculate_rouge_score(reference, llama2_results_clean)
+
+        recall_model = calculate_recall_at_k(model_results_clean, reference, 3)
+        precision_model = calculate_precision_at_k(model_results_clean, reference, 3)
+        ndcg_model = calculate_ndcg_at_k(model_results_clean, reference, 3)
+
+        recall_llama = calculate_recall_at_k(llama2_results_clean, reference, 3)
+        precision_llama = calculate_precision_at_k(llama2_results_clean, reference, 3)
+        ndcg_llama = calculate_ndcg_at_k(llama2_results_clean, reference, 3)
+
+        results.append({
+            "query": query,
+            "models_top3": model_results,
+            "llama2_top3": llama2_results,
+            "models_recall@3": recall_model,
+            "models_precision@3": precision_model,
+            "models_ndcg@3": ndcg_model,
+            "llama2_recall@3": recall_llama,
+            "llama2_precision@3": precision_llama,
+            "llama2_ndcg@3": ndcg_llama
+        })
+
+    df_results = pd.DataFrame(results)
+    session.close()
+
+##if __name__ == "__main__":
+  ##  main_evaluation()
 
