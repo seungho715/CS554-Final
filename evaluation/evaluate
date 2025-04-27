@@ -1,6 +1,5 @@
 from bert_score import score
 from main import main
-from recommendation.RecommendationEngine import RecommendationEngine
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import pandas as pd
@@ -70,14 +69,17 @@ def clean_cuisine(text: str) -> str:
     return t[:-1] if t.endswith("s") and len(t) > 1 else t
 
 def calculate_recall_at_k(predictions, gold, k):
+    """Calculate Recall."""
     hits = sum(1 for pred in predictions[:k] if pred in gold)
     return hits / min(k, len(gold)) if gold else 0
 
 def calculate_precision_at_k(predictions, gold, k):
+    """Calculate Precision."""
     hits = sum(1 for pred in predictions[:k] if pred in gold)
     return hits / k
 
 def calculate_ndcg_at_k(predictions, gold, k):
+    """Calculate NDCG score."""
     true_relevance = [1 if item in gold else 0 for item in predictions[:k]]
     if not any(true_relevance):
         return 0.0
@@ -95,8 +97,8 @@ def calculate_rouge_score(reference, hypothesis):
     scores = scorer.score(" ".join(reference), " ".join(hypothesis))
     return scores['rougeL'].fmeasure
 
-def simulate_query_flow(user_query, dm, rec_engine, ranker, all_cuisines):
-    """Simulate full main() flow for a user query."""
+def simulate_query(user_query, dm, rec_engine, ranker, all_cuisines):
+    """Simulate main() for a user query."""
     history = f"User: {user_query}\n"
     slots = {}
     awaiting_slot = None
@@ -188,7 +190,7 @@ def evaluation():
     for query in queries:
         print(f"\nEvaluating Query: '{query}'")
 
-        model_results = simulate_query_flow(query, dm, rec_engine, ranker, all_cuisines)
+        model_results = simulate_query(query, dm, rec_engine, ranker, all_cuisines)
         llama2_results = llama2_real_response(query)
 
         if model_results is None:
