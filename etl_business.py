@@ -1,9 +1,13 @@
 from sqlalchemy import create_engine, Column, String, Float, Integer, JSON, Text, ForeignKey, PrimaryKeyConstraint, text, MetaData
 from sqlalchemy.orm import sessionmaker, declarative_base
 import json
+from dotenv import load_dotenv
+import os
 
 # Define the ORM base class
 Base = declarative_base()
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 #############################
 # Define the Business Model #
@@ -59,7 +63,6 @@ class Photo(Base):
 #############################
 # Database Setup and ETL    #
 #############################
-DATABASE_URL = "postgresql://postgres:qaz123@localhost:5433/yelp_db"
 
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
