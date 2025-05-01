@@ -1,7 +1,9 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import json
 import pandas as pd
 from dialogue.DialogueManager import DialogueManager
-from recommendation.RecommendationEngine import RecommendationEngine
 from ranker.Ranker import Ranker
 from nltk.translate.bleu_score import sentence_bleu
 from rouge_score import rouge_scorer
@@ -44,6 +46,68 @@ os.makedirs("../Dataset", exist_ok=True)
 source_dir = dataset_dir
 shutil.copy(f"{source_dir}/yelp_academic_dataset_business.json", "../Dataset/yelp_academic_dataset_business.json")
 shutil.copy(f"{source_dir}/yelp_academic_dataset_review.json", "../Dataset/yelp_academic_dataset_review.json")
+
+#----------------Need to define Recommendation Engine without the DB -------
+import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
+import torch
+
+class Recommendation_Engine:
+    def __init__(self, business_json_path, top_k=5):
+        # Load businesses directly from JSON
+        self.businesses = self.load_businesses_from_json(business_json_path)
+
+        # Initialize embedding model
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+
+        self.index = None
+        self.business_embeddings = None
+        self.top_k = top_k
+
+        # Build FAISS index
+        self.build_index()
+
+    def load_businesses_from_json(self, json_path):
+        businesses = []
+        with open(json_path, 'r') as f:
+            for line in f:
+                business = json.loads(line)
+                if business.get("name") and business.get("address"):
+                    businesses.append(business)
+        return businesses
+
+    def build_corpus(self):
+        corpus = []
+        for business in self.businesses:
+            categories = business.get("categories") or ""
+            if isinstance(categories, list):
+                categories = ", ".join(categories)
+            corpus.append(
+                f"{business['name']}. Categories: {categories}. "
+                f"Located at: {business['address']}, {business['city']}, {business['state']}."
+            )
+        return corpus
+
+    def build_index(self):
+        corpus = self.build_corpus()
+        print("Embedding business data...")
+        embeddings = self.model.encode(corpus, show_progress_bar=True)
+        self.business_embeddings = np.array(embeddings).astype('float32')
+        dimension = self.business_embeddings.shape[1]
+
+        print(f"Building FAISS Index with dimension {dimension}")
+        self.index = faiss.IndexFlatL2(dimension)
+        self.index.add(self.business_embeddings)
+        print(f"Successfully built with {len(corpus)} items")
+
+    def search(self, query, top_k=None):
+        top_k = top_k or self.top_k
+        query_embedding = np.array(self.model.encode([query]), dtype='float32')
+        distances, indices = self.index.search(query_embedding, top_k)
+        return [self.businesses[idx] for idx in indices[0]]
 
 # --------------- Utility Functions ----------------
 def clean_cuisine(text: str) -> str:
@@ -559,7 +623,7 @@ def batch_evaluate_model_vs_llm_refactored(
 evaluation_df = batch_evaluate_model_vs_llm_refactored(
     queries=queries_with_cat,
     dm=DialogueManager(),
-    rec_engine=RecommendationEngine(json_path),
+    rec_engine=Recommendation_Engine(json_path),
     ranker=Ranker(),
     all_cuisines=all_cuisines,
     all_businesses=all_businesses,
