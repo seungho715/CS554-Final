@@ -1,29 +1,264 @@
-from bert_score import score
-from main import main
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import json
 import pandas as pd
-import os
-from dotenv import load_dotenv
-from huggingface_hub import login
-import random
-import numpy as np
-from sklearn.metrics import ndcg_score
 from dialogue.DialogueManager import DialogueManager
 from recommendation.RecommendationEngine import RecommendationEngine
-from recommendation.ReviewRetrieval import ReviewRetrieval
 from ranker.Ranker import Ranker
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import create_engine
-from etl_business import Business, DATABASE_URL
 from nltk.translate.bleu_score import sentence_bleu
 from rouge_score import rouge_scorer
+import display
+import os
+import shutil
+import zipfile
+from kagglehub import dataset_download
+import rapidfuzz as fuzz
+from bert_score import score
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import random
+from collections import Counter
+from sentence_transformers import SentenceTransformer, util
+import numpy as np
+import re
+from difflib import get_close_matches
+from huggingface_hub import login
 
-load_dotenv()  
-database_url = os.getenv('DATABASE_URL')
-huggingface_token = os.getenv('HUGGINGFACE_TOKEN')
+# --------------- Connect to Hugging Face ----------------
+hf_token =os.getenv('HF_TOKEN')
+login(token = hf_token)
 
-login(token=huggingface_token)
+
+# --------------- Import Data (No Database Connection) ----------------
+path = dataset_download("yelp-dataset/yelp-dataset")
+print("Path to dataset files:", path)
+
+if path.endswith('.zip'):
+    with zipfile.ZipFile(path, 'r') as zip_ref:
+        zip_ref.extractall('yelp_dataset')
+    dataset_dir = 'yelp_dataset'
+else:
+    dataset_dir = path
+
+print("Dataset directory:", dataset_dir)
+
+# Copy files to working directory 
+os.makedirs("../Dataset", exist_ok=True)
+source_dir = dataset_dir
+shutil.copy(f"{source_dir}/yelp_academic_dataset_business.json", "../Dataset/yelp_academic_dataset_business.json")
+shutil.copy(f"{source_dir}/yelp_academic_dataset_review.json", "../Dataset/yelp_academic_dataset_review.json")
+
+# --------------- Utility Functions ----------------
+def clean_cuisine(text: str) -> str:
+  t = text.strip().lower()
+  return t[:-1] if t.endswith("s") and len(t) > 1 else t
+
+def is_valid_cuisine(cat):
+    return (
+        cat in ALLOWED_KEYWORDS or
+        'food' in cat or
+        'cuisine' in cat
+    )
+valid_cuisines = sorted([cat for cat in category_counts if is_valid_cuisine(cat)])
+
+def normalize(name):
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9 ]", "", name)
+    return name.strip()
+
+def fuzzy_match(pred, gold_list, threshold=70):
+    pred_norm = normalize(pred)
+    for gold in gold_list:
+        if fuzz.partial_ratio(pred_norm, normalize(gold)) >= threshold:
+            return True
+    return False
+
+def clean_name(name):
+    return name.lower().strip().strip(".").strip(",")
+
+def extract_llm_business_names(llm_output):
+    text = " ".join(llm_output)
+    names = re.findall(r"[\*\-\d\.\)]\s*([A-Z][A-Za-z &'\-]+)", text)
+    if not names:
+        names = [x.strip() for x in text.split('\n') if x and len(x) > 3]
+    return names[:3]
+
+def lookup_business_data(name, all_businesses):
+    name = name.lower().strip()
+    for b in all_businesses:
+        if name in b.get("name", "").lower():
+            return {
+                "name": b.get("name"),
+                "categories": b.get("categories"),
+                "city": b.get("city"),
+                "stars": b.get("stars", 0),
+                "review_count": b.get("review_count", 0)
+            }
+    return None
+
+def semantic_similarity(query, recs):
+    if not recs:
+        return 0.0
+    query_embed = model_embedder.encode(query, convert_to_tensor=True)
+    texts = [f"{r['name']}, {r['categories']}, {r['city']}" for r in recs]
+    desc_embed = model_embedder.encode(texts, convert_to_tensor=True)
+    sim = util.cos_sim(query_embed, desc_embed)
+    return float(sim.mean())
+
+def average_stars(recs):
+    return round(np.mean([r.get("stars", 0) for r in recs]), 2) if recs else 0.0
+
+def average_reviews(recs):
+    return round(np.mean([r.get("review_count", 0) for r in recs]), 1) if recs else 0.0
+
+def category_match_score(recs, target):
+    return sum(target in (r.get("categories", "").lower()) for r in recs) / len(recs) if recs else 0.0
+
+def star_threshold_coverage(recs, threshold=4.0):
+    return sum(r.get("stars", 0) >= threshold for r in recs) / len(recs) if recs else 0.0
+
+def category_diversity(recs):
+    cats = set()
+    for r in recs:
+        for c in (r.get("categories") or "").lower().split(","):
+            cats.add(c.strip())
+    return len(cats)
+
+def novelty_score(recs):
+    return sum(r['name'].lower() not in CHAIN_NAMES for r in recs) / len(recs) if recs else 0.0
+
+def intra_list_similarity(recs):
+    if not recs or len(recs) < 2:
+        return 0.0
+    texts = [f"{r['name']} {r['categories']} {r['city']}" for r in recs]
+    embeds = model_embedder.encode(texts, convert_to_tensor=True)
+    sim_matrix = util.cos_sim(embeds, embeds).cpu().numpy()
+    tril = np.tril(sim_matrix, k=-1)
+    return float(tril.sum() / (len(recs) * (len(recs) - 1) / 2))
+
+def match_names(predicted, ground_truth, threshold=0.8):
+    """
+    Fuzzy matching between predicted and ground-truth names.
+    Returns binary match list for predicted items.
+    """
+    matched = []
+    ground_truth_clean = [g.lower() for g in ground_truth]
+
+    for pred in predicted:
+        pred_clean = pred.lower()
+        close = get_close_matches(pred_clean, ground_truth_clean, n=1, cutoff=threshold)
+        matched.append(1 if close else 0)
+
+    return matched
+
+def compute_all_metrics(query, recs, target_category):
+    metrics = {
+        "semantic_similarity": semantic_similarity(query, recs),
+        "avg_stars": average_stars(recs),
+        "avg_reviews": average_reviews(recs),
+        "category_match_score": category_match_score(recs, target_category),
+        "star_threshold_coverage": star_threshold_coverage(recs),
+        "category_diversity": category_diversity(recs),
+        "novelty_score": novelty_score(recs),
+        "intra_list_similarity": intra_list_similarity(recs)
+    }
+    return metrics
+
+def ndcg_at_k(predicted, ground_truth, k=3):
+    predicted = [clean_name(p) for p in predicted[:k]]
+    ground_truth = {clean_name(g) for g in ground_truth}
+    dcg = sum(int(p in ground_truth) / np.log2(i + 2) for i, p in enumerate(predicted))
+    idcg = sum(1.0 / np.log2(i + 2) for i in range(min(len(ground_truth), k)))
+    return dcg / idcg if idcg > 0 else 0.0
+
+def map_at_k(predicted, ground_truth, k=3):
+    predicted = [clean_name(p) for p in predicted[:k]]
+    ground_truth = {clean_name(g) for g in ground_truth}
+    hits = 0
+    score = 0.0
+    for i, p in enumerate(predicted):
+        if p in ground_truth:
+            hits += 1
+            score += hits / (i + 1)
+    return score / min(len(ground_truth), k) if ground_truth else 0.0
+
+def hit_rate_at_k(predicted, ground_truth, k=3):
+    predicted = {clean_name(p) for p in predicted[:k]}
+    ground_truth = {clean_name(g) for g in ground_truth}
+    return 1.0 if predicted & ground_truth else 0.0
+
+def mrr_at_k(predicted, ground_truth, k=3):
+    predicted = [clean_name(p) for p in predicted[:k]]
+    ground_truth = {clean_name(g) for g in ground_truth}
+    for i, p in enumerate(predicted):
+        if p in ground_truth:
+            return 1.0 / (i + 1)
+    return 0.0
+
+def evaluate_ranking_metrics(model_recs_dict, ground_truth_names, k=3):
+    results = []
+
+    for query, model_preds in model_recs_dict.items():
+        ground_truth = ground_truth_names.get(query, [])
+
+        # Clean both lists
+        model_preds = [clean_name(x) for x in model_preds[:k]]
+        gt_names = [clean_name(x) for x in ground_truth]
+
+        precision = sum(p in gt_names for p in model_preds) / k if k else 0
+        recall = sum(p in gt_names for p in model_preds) / len(gt_names) if gt_names else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0
+
+        ndcg = ndcg_at_k(model_preds, gt_names, k)
+        map_score = map_at_k(model_preds, gt_names, k)
+        hit_rate = hit_rate_at_k(model_preds, gt_names, k)
+        mrr = mrr_at_k(model_preds, gt_names, k)
+
+        results.append({
+            "query": query,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "ndcg": ndcg,
+            "map": map_score,
+            "hit_rate": hit_rate,
+            "mrr": mrr
+        })
+
+    return pd.DataFrame(results)
+
+
+# --------------- Load Business Data ----------------
+def load_businesses(json_path):
+    businesses = []
+    all_cuisines = set()
+
+    with open(json_path, 'r') as f:
+        for line in f:
+            data = json.loads(line)
+            businesses.append(data)
+            categories = data.get("categories")
+            if not categories:
+                continue
+            for c in categories.split(','):
+                c = c.strip().lower()
+                if c.endswith('s'):
+                    c = c[:-1]
+                all_cuisines.add(c)
+
+    return businesses, all_cuisines
+
+# Load business data into DataFrame
+json_path = "../Dataset/yelp_academic_dataset_business.json"
+business_data = []
+
+with open(json_path, "r", encoding="utf-8") as f:
+    for line in f:
+        business_data.append(json.loads(line))
+
+yelp_df = pd.DataFrame(business_data)
+all_categories = yelp_df['categories'].dropna().str.lower().str.split(',').explode().str.strip()
+category_counts = Counter(all_categories)
+all_businesses, all_cuisines = load_businesses(json_path)
+
+# --------------- Define Model to Evaluate Against ----------------
 
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -32,204 +267,345 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_quant_type="nf4"
 )
 
-model = AutoModelForCausalLM.from_pretrained(
+llama_model = AutoModelForCausalLM.from_pretrained(
     "meta-llama/Llama-2-7b-chat-hf",
     quantization_config=bnb_config,
     device_map="auto",
     trust_remote_code=True,
     offload_folder="offload")
 
-tokenizer = AutoTokenizer.from_pretrained(
+llama_tokenizer = AutoTokenizer.from_pretrained(
     "meta-llama/Llama-2-7b-chat-hf",
     use_fast=False,
     trust_remote_code=True
 )
 
-def llama2_real_response(query, tokenizer, model, max_new_tokens=128):
-    """Query LLaMA 2 7B for restaurant recommendations."""
+# --------------- Feature Eng. ----------------
+yelp_df["city_lower"] = yelp_df["city"].str.lower()
+
+def extract_normalized_cuisine(categories):
+    if not categories:
+        return None
+    for cat in categories.split(","):
+        cat = cat.strip().lower()
+        if cat.endswith("s") and len(cat) > 1:
+            cat = cat[:-1]
+        return cat
+    return None
+
+yelp_df["normalized_cuisine"] = yelp_df["categories"].apply(extract_normalized_cuisine)
+
+city_cuisine_counts = yelp_df.groupby(["city_lower", "normalized_cuisine"]).size().unstack(fill_value=0)
+city_cuisine_counts = city_cuisine_counts.loc[:, (city_cuisine_counts != 0).any(axis=0)]
+top_cities = city_cuisine_counts.sum(axis=1).sort_values(ascending=False).head(15).index.tolist()
+
+# --------------- Simulate a User Query Flow ----------------
+
+def simulate_query_flow(query, dm, rec_engine, ranker, all_cuisines, businesses):
+    history = f"User: {query}\n"
+    slots = {}
+
+    # Fallback slot: cuisine
+    generic_terms = {"restaurant", "restaurants", "food", "dining"}
+    for c in all_cuisines:
+        if c in query.lower() and c not in generic_terms:
+            slots["cuisine"] = c
+            break
+
+    # Fallback slot: location
+    fallback_locations = ['las vegas', 'boston', 'worcester', 'phoenix', 'toronto']
+    for loc in fallback_locations:
+        if loc in query.lower():
+            slots["location"] = loc
+            break
+
+    new_slots = dm.process_conversation(history)
+    if new_slots.get("cuisine"):
+        slots["cuisine"] = clean_cuisine(new_slots["cuisine"])
+    if new_slots.get("location"):
+        slots["location"] = new_slots["location"].lower().strip()
+
+    # Debug slot extraction
+    print("Extracted slots:", slots)
+
+    # Build FAISS search query
+    if slots.get("cuisine") and slots.get("location"):
+        search_query = f"{slots['cuisine']} restaurants in {slots['location']}"
+    elif slots.get("cuisine"):
+        search_query = f"{slots['cuisine']} restaurants"
+    else:
+        search_query = query  # fallback to full query
+
+    print(f"FAISS search query: {search_query}")
+    raw_results = rec_engine.search(search_query, top_k=50)
+
+    if not raw_results:
+        print(f"No results returned from FAISS for query: {search_query}")
+        return None
+
+    # Convert raw results into candidate format for reranking
+    candidates = [
+        {
+            "business_id": b.get("business_id"),
+            "name": b.get("name"),
+            "address": b.get("address"),
+            "city": b.get("city"),
+            "state": b.get("state"),
+            "categories": b.get("categories"),
+            "stars": b.get("stars", 0)
+        }
+        for b in raw_results
+        if b.get("name") and b.get("categories") and b.get("city")
+    ]
+
+    if not candidates:
+        print(f"No valid business entries found among FAISS matches.")
+        return None
+
+    # Rerank using ranker
+    ranked = ranker.rerank(search_query, candidates=candidates)
+    return [r['name'] for r in ranked[:3]] if ranked else None
+
+
+ALLOWED_KEYWORDS = {
+    "thai", "mexican", "italian", "japanese", "chinese", "indian", "korean", "vietnamese",
+    "greek", "mediterranean", "lebanese", "ethiopian", "turkish", "french", "german", "cuban",
+    "brazilian", "argentine", "peruvian", "afghan", "pakistani", "halal", "vegetarian",
+    "vegan", "bbq", "burger", "pizza", "seafood", "sushi", "steakhouse", "soul food", "dimsum"
+}
+
+# --------------- Generating Queries to extract ground truth ----------------
+def generate_queries(cities, valid_cuisines, n=20):
+    templates = [
+        "Best {} restaurants in {}",
+        "Find me a {} place in {}",
+        "Top-rated {} food in {}",
+        "Affordable {} spots in {}",
+        "Where can I get good {} in {}"
+    ]
+    queries = []
+    for _ in range(n):
+        cuisine = random.choice(valid_cuisines)
+        city = random.choice(cities)
+        template = random.choice(templates)
+        query = template.format(cuisine, city)
+        queries.append((query, cuisine))
+    return queries
+
+queries_with_cat = generate_queries(top_cities, valid_cuisines, n=15)
+queries = [q for q, _ in queries_with_cat]
+
+def generate_ground_truth(query, yelp_df, all_cuisines, top_n=100, debug=False):
+    """
+    Extract ground truth restaurants from Yelp dataset based on the query.
+    Returns top_n businesses ranked by stars and review count.
+    """
+    def log(msg):
+        if debug:
+            print(msg)
+
+    log(f"\nQuery: {query}")
+    query_lower = query.lower()
+    slots = {}
+
+    # Extract cuisine from all_cuisines
+    generic_terms = {"restaurant", "restaurants", "food", "dining", "place", "spots"}
+    for cuisine in all_cuisines:
+        if cuisine in query_lower and cuisine not in generic_terms:
+            slots["cuisine"] = cuisine
+            break
+
+    # Extract city using fuzzy match
+    for city in yelp_df["city_lower"].dropna().unique():
+        if city in query_lower:
+            slots["location"] = city
+            break
+
+    if not slots.get("cuisine") or not slots.get("location"):
+        log("Could not extract cuisine or city.")
+        return []
+
+    cuisine = slots["cuisine"]
+    city = slots["location"]
+    log(f"Extracted - Cuisine: {cuisine}, City: {city}")
+
+    # Filter by city
+    city_df = yelp_df[yelp_df["city_lower"] == city]
+
+    if city_df.empty:
+        log("No businesses found for city.")
+        return []
+
+    # Filter by cuisine
+    matched = city_df[city_df["categories"].str.contains(cuisine, case=False, na=False)]
+
+    if matched.empty:
+        log("No matches found for cuisine in city.")
+        return []
+
+    # Score and rank
+    matched = matched.copy()
+    matched["score"] = (
+        0.6 * matched["stars"].fillna(0) +
+        0.4 * (matched["review_count"].fillna(0) / matched["review_count"].max())
+    )
+
+    top_matches = matched.sort_values("score", ascending=False).head(top_n)
+    log(f"Top {top_n} matches:\n{top_matches[['name', 'stars', 'review_count']].head()}")
+
+    return top_matches[["name", "address", "city", "stars", "review_count", "categories"]].to_dict("records")
+
+ground_truths = {q: generate_ground_truth(q, yelp_df, all_cuisines) for q in queries}
+
+ground_truth_names = {
+    query: [entry["name"] for entry in entries]
+    for query, entries in ground_truths.items()
+}
+
+
+# Load embedding model
+model_embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Known chain brands for novelty
+CHAIN_NAMES = {'starbucks', 'pizza hut', 'mcdonald', 'subway', 'domino', 'wendy', 'dunkin', 'taco bell'}
+
+def clean_llm_top3(llm_top3):
+    """Extract only proper restaurant names from LLM outputs."""
+    cleaned = []
+    for entry in llm_top3:
+        for line in entry.split("\n"):
+            name = line.strip()
+            if name and not any(
+                w in name.lower() for w in ["specific", "restaurant", "names", "for", "here are", "you might like"]
+            ):
+                cleaned.append(name)
+    return cleaned[1:4]  #LLM usually outputs "Sure!,", an attempt to prevent this 
+
+def llama2_real_response_cleaned(query, tokenizer, model, max_new_tokens=128):
     system_prompt = (
         "You are a helpful restaurant recommendation assistant. "
-        "Given a user request, suggest 3 specific restaurant names. "
-        "List the restaurants separated by commas."
+        "Given a user request, suggest ONLY 3 specific restaurant names. "
+        "Respond with ONLY a comma-separated list of names, nothing else. "
+        "This is an example, 'Restaurant A, Restaurant B, Restaurant C'"
+        "Do not output anything more than this list of 3 restaurants"
     )
+
     full_prompt = f"[INST] {system_prompt}\nUser: {query} [/INST]"
 
     inputs = tokenizer(full_prompt, return_tensors="pt").to(model.device)
-    output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True, top_p=0.95, temperature=0.7)
+    output = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        top_p=0.95,
+        temperature=0.7,
+        pad_token_id=tokenizer.eos_token_id
+    )
 
     decoded = tokenizer.decode(output[0], skip_special_tokens=True)
+    response_text = decoded.split('[/INST]')[-1].strip() if '[/INST]' in decoded else decoded.strip()
 
-    response_text = decoded.split('[/INST]')[-1].strip()
-    recommended = [x.strip() for x in response_text.split(",") if x.strip()]
+    # Fallback to comma split, then clean each entry
+    rough_names = [x.strip() for x in response_text.split(",") if x.strip()]
+    return clean_llm_top3(rough_names)
 
-    return recommended[:3]
 
-def clean_cuisine(text: str) -> str:
-    t = text.strip().lower()
-    return t[:-1] if t.endswith("s") and len(t) > 1 else t
+#--------------Evaluation Recommendation Quality Metrics (versus LLM Output)-------
 
-def calculate_recall_at_k(predictions, gold, k):
-    """Calculate Recall."""
-    hits = sum(1 for pred in predictions[:k] if pred in gold)
-    return hits / min(k, len(gold)) if gold else 0
-
-def calculate_precision_at_k(predictions, gold, k):
-    """Calculate Precision."""
-    hits = sum(1 for pred in predictions[:k] if pred in gold)
-    return hits / k
-
-def calculate_ndcg_at_k(predictions, gold, k):
-    """Calculate NDCG score."""
-    true_relevance = [1 if item in gold else 0 for item in predictions[:k]]
-    if not any(true_relevance):
-        return 0.0
-    return ndcg_score([true_relevance], [sorted(true_relevance, reverse=True)])
-
-def calculate_bleu_score(reference, hypothesis):
-    """Calculate BLEU score between two lists."""
-    reference = gold_standard[query]
-    return sentence_bleu([reference], hypothesis)
-
-def calculate_rouge_score(reference, hypothesis):
-    """Calculate ROUGE-L score."""
-    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-    reference = gold_standard[query]
-    scores = scorer.score(" ".join(reference), " ".join(hypothesis))
-    return scores['rougeL'].fmeasure
-
-def simulate_query(user_query, dm, rec_engine, ranker, all_cuisines):
-    """Simulate main() for a user query."""
-    history = f"User: {user_query}\n"
-    slots = {}
-    awaiting_slot = None
-
-    # 1. Keyword fallback for cuisine
-    if not slots.get("cuisine"):
-        for c in all_cuisines:
-            if c in user_query.lower():
-                slots["cuisine"] = c
-                break
-
-    # 2. LLM slot filling
-    new_slots = dm.process_conversation(history)
-    if new_slots.get("cuisine") is not None:
-        new_slots["cuisine"] = clean_cuisine(new_slots["cuisine"])
-    for k in ("cuisine", "location", "recent_review_requested", "other_info"):
-        if new_slots.get(k) is not None:
-            slots[k] = new_slots[k]
-
-    # 3. Skip if missing info
-    if not slots.get("cuisine") or not slots.get("location"):
-        return None
-
-    # 4. Perform recommendation + reranking
-    query = f"{slots['cuisine']} restaurants in {slots['location']}"
-    raw = rec_engine.search(query)
-    cands = [
-        {
-            "business_id": b.business_id,
-            "name": b.name,
-            "address": b.address,
-            "city": b.city,
-            "state": b.state,
-            "categories": b.categories,
-            "stars": b.stars
-        }
-        for b in raw
-    ]
-    ranked = ranker.rerank(query, candidates=cands)
-
-    if not ranked:
-        return None
-
-    top_recommendations = [r['name'] for r in ranked[:3]]
-
-    return top_recommendations
-
-def evaluation():
-##MODEL SETUP
-    dm = DialogueManager()
-    rec_engine = RecommendationEngine()
-    ranker = Ranker()
-    rr = ReviewRetrieval()
-
-    db_engine = create_engine(DATABASE_URL)
-    Session = sessionmaker(bind=db_engine)
-    session = Session()
-
-    rows = session.query(Business.categories).distinct().all()
-    all_cuisines = set()
-    for (cats,) in rows:
-        if not cats:
-            continue
-        for c in cats.split(","):
-            c = c.strip().lower()
-            if c.endswith("s"):
-                c = c[:-1]
-            all_cuisines.add(c)
-
-##QUERY GENERATION, add query generator?
-    queries = [
-        "Find me a sushi restaurant in Worcester",
-        "Best Italian food in the North End of Boston",
-        "Good coffee with seating and wifi in Worcester",
-        "Vegan brunch places in Boston",
-        "Free karaoke in Worcester"
-        ]
-
-    gold_standard = {
-        "Find me a sushi restaurant in Worcester": ['Baba Sushi', 'The Sole Proprietor', 'Kenichi Bistro', 'Sushi Miyazawa'],
-        "Best Italian food in the North End of Boston": ['Mamma Maria', 'Bricco', 'Trattoria Il Panino'],
-        "Good coffee with seating and wifi in Worcester": ['InHouse Coffee', 'Acoustic Java', 'Birchtree Bread Company'],
-        "Vegan brunch places in Boston": ['Cocobeet', 'Whole Heart Provisions', 'Life Alive Organic Cafe'],
-        "Free karaoke in Worcester": ['KTV Karaoke Club', 'Electric Haze', 'Nick’s Bar and Restaurant'],
-    }
-
+def batch_evaluate_model_vs_llm_refactored(
+    queries,
+    dm,
+    rec_engine,
+    ranker,
+    all_cuisines,
+    all_businesses,
+    llama_tokenizer,
+    llama_model,
+    output_csv_path="evaluation_results.csv"
+):
     results = []
-##EVAL
-    for query in queries:
-        print(f"\nEvaluating Query: '{query}'")
 
-        model_results = simulate_query(query, dm, rec_engine, ranker, all_cuisines)
-        llama2_results = llama2_real_response(query)
+    for query_text, target_cat in queries:
+        print(f"Evaluating: {query_text}")
 
-        if model_results is None:
-            print(f"Skipping '{query}' — missing information from your system.")
-            continue
+        # Model flow
+        model_names = simulate_query_flow(query_text, dm, rec_engine, ranker, all_cuisines, all_businesses)
+        model_data = [lookup_business_data(n, all_businesses) for n in model_names or []]
+        model_data = [r for r in model_data if r]
 
-        reference = [x.lower().strip() for x in gold_standard[query]]
-        model_results_clean = [x.lower().strip() for x in model_results]
-        llama2_results_clean = [x.lower().strip() for x in llama2_results]
+        # LLM flow
+        llm_names = llama2_real_response_cleaned(query_text, tokenizer=llama_tokenizer, model=llama_model)
+        llm_data = [lookup_business_data(n, all_businesses) for n in llm_names]
+        llm_data = [r for r in llm_data if r]
 
-        bleu_model = calculate_bleu_score(reference, model_results_clean)
-        rouge_model = calculate_rouge_score(reference, model_results_clean)
-
-        bleu_llama = calculate_bleu_score(reference, llama2_results_clean)
-        rouge_llama = calculate_rouge_score(reference, llama2_results_clean)
-
-        recall_model = calculate_recall_at_k(model_results_clean, reference, 3)
-        precision_model = calculate_precision_at_k(model_results_clean, reference, 3)
-        ndcg_model = calculate_ndcg_at_k(model_results_clean, reference, 3)
-
-        recall_llama = calculate_recall_at_k(llama2_results_clean, reference, 3)
-        precision_llama = calculate_precision_at_k(llama2_results_clean, reference, 3)
-        ndcg_llama = calculate_ndcg_at_k(llama2_results_clean, reference, 3)
+        # Compute metrics
+        model_metrics = compute_all_metrics(query_text, model_data, target_cat)
+        llm_metrics = compute_all_metrics(query_text, llm_data, target_cat)
 
         results.append({
-            "query": query,
-            "models_top3": model_results,
-            "llama2_top3": llama2_results,
-            "models_recall@3": recall_model,
-            "models_precision@3": precision_model,
-            "models_ndcg@3": ndcg_model,
-            "llama2_recall@3": recall_llama,
-            "llama2_precision@3": precision_llama,
-            "llama2_ndcg@3": ndcg_llama
+            "query": query_text,
+            "target_category": target_cat,
+            "model_top3": model_names,
+            "llm_top3": llm_names,
+            **{f"model_{k}": v for k, v in model_metrics.items()},
+            **{f"llm_{k}": v for k, v in llm_metrics.items()}
         })
 
     df_results = pd.DataFrame(results)
-    session.close()
+    df_results.to_csv(output_csv_path, index=False)
+    return df_results
 
-##if __name__ == "__main__":
-  ##  evaluation()
 
+evaluation_df = batch_evaluate_model_vs_llm_refactored(
+    queries=queries_with_cat,
+    dm=DialogueManager(),
+    rec_engine=RecommendationEngine(json_path),
+    ranker=Ranker(),
+    all_cuisines=all_cuisines,
+    all_businesses=all_businesses,
+    llama_tokenizer=llama_tokenizer,
+    llama_model=llama_model
+)
+
+all_metrics = []
+
+for query, cuisine in queries_with_cat:
+    # Skip if no ground truth
+    if query not in ground_truth_names:
+        continue
+
+    # Get LLM recommendations
+    llm_recs = llama2_real_response_cleaned(
+        query,
+        llama_tokenizer,
+        llama_model
+        )
+
+    # Convert names to business dicts
+    recs_full_data = []
+    for name in llm_recs:
+        match = lookup_business_data(name, yelp_df.to_dict("records"))
+        if match:
+            recs_full_data.append(match)
+
+    # Compute evaluation metrics
+    metrics = compute_all_metrics(
+        query=query,
+        recs=recs_full_data,
+        target_category=cuisine,
+        ground_truth_names=ground_truth_names[query]
+    )
+    metrics["query"] = query
+    all_metrics.append(metrics)
+
+metrics_df = pd.DataFrame(all_metrics)
+
+model_outputs = dict(zip(evaluation_df["query"], evaluation_df["model_top3"]))
+llm_outputs = dict(zip(evaluation_df["query"], evaluation_df["llm_top3"]))
+
+#--------------Evaluation Metrics (versus Hypothetical GT)-------
+model_outputs = dict(zip(evaluation_df["query"], evaluation_df["model_top3"]))
+llm_outputs = dict(zip(evaluation_df["query"], evaluation_df["llm_top3"]))
+
+metrics_df = evaluate_ranking_metrics(model_outputs, ground_truth_names, k=3)
+display(metrics_df.mean(numeric_only=True))
