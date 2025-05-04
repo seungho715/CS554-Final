@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Chatbot</title>
+    <title>Yelp Recommender Engine</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
@@ -12,7 +12,7 @@
         <nav class="nav-bar">
             <div class="nav-content">
                 <div class="nav-items">
-                    <h1 class="site-title">Yelp Dataset - Recommendor Engine</h1>
+                    <h1 class="site-title">Yelp Dataset - Recommender Engine</h1>
                     <div class="nav-links">
                         <a href="">CS554 - NLP</a>
                         <a href="">References</a>
@@ -41,6 +41,14 @@
             <div class="input-area">
                 <input type="text" id="chat-input" placeholder="Type your message..." onkeydown="checkEnter(event)" />
                 <button onclick="sendMessage()">Send</button>
+                <span class="file-upload">
+                    <span class="file-upload-btn">📷</span>
+                    <input type="file" id="image-upload" accept="image/*" onchange="handleImageUpload(event)">
+                </span>
+            </div>
+
+            <div id="image-preview" class="image-preview">
+                <img id="preview-img" src="" alt="Preview">
             </div>
         </div>
     </div>
@@ -48,10 +56,26 @@
     <script>
         let currentChatId = 0; // To track the current chat
         let chats = {}; // To store chat data
+        let currentImage = null; // To store the current image
+        let sessionId = null; // To store the current session ID from the backend
 
         // Initialize the first chat when the page loads
         window.onload = function() {
-            newChat();  // Automatically create the first chat
+            // Get a session ID from the backend
+            fetch("/session", {
+                method: "POST"
+            })
+            .then(response => response.json())
+            .then(data => {
+                sessionId = data.session_id;
+                console.log("Session ID:", sessionId);
+                newChat();  // Create the first chat after getting session ID
+            })
+            .catch(err => {
+                console.error("Error getting session ID:", err);
+                // Create a chat anyway, we'll generate a local ID if needed
+                newChat();
+            });
         };
 
         function newChat() {
@@ -60,6 +84,14 @@
             chats[currentChatId] = [];
             updateChatHistory();
             document.getElementById("chat-box").innerHTML = ""; // Clear the chat box
+            
+            // Welcome message
+            const welcomeMsg = { 
+                sender: 'bot', 
+                text: "Welcome! I can help you find restaurants. What cuisine are you interested in?" 
+            };
+            chats[currentChatId].push(welcomeMsg);
+            displayMessage(welcomeMsg);
         }
 
         function switchChat(chatId) {
@@ -73,14 +105,80 @@
             });
         }
 
+        function handleImageUpload(event) {
+            const file = event.target.files[0];
+            if (file && file.type.match('image.*')) {
+                const reader = new FileReader();
+                
+                reader.onload = function(e) {
+                    // Store the image data
+                    currentImage = e.target.result;
+                    
+                    // Show preview
+                    const previewArea = document.getElementById('image-preview');
+                    const previewImg = document.getElementById('preview-img');
+                    previewImg.src = currentImage;
+                    previewArea.style.display = 'block';
+                }
+                
+                reader.readAsDataURL(file);
+            }
+        }
+
+        function resetImagePreview() {
+            const previewArea = document.getElementById('image-preview');
+            const previewImg = document.getElementById('preview-img');
+            previewImg.src = '';
+            previewArea.style.display = 'none';
+            currentImage = null;
+            
+            // Reset the file input
+            const fileInput = document.getElementById('image-upload');
+            if (fileInput) {
+                fileInput.value = '';
+            }
+        }
+
         function displayMessage(msg) {
             const messageElement = document.createElement("div");
             messageElement.classList.add(msg.sender);
             messageElement.innerHTML = `
-                
                 ${msg.sender === 'bot' ? '<img src="https://via.placeholder.com/50" class="bot-img" alt="Bot Image">' : ''}
                 <p>${msg.text}</p>
             `;
+            
+            // If the message contains restaurant results, display them
+            if (msg.results) {
+                const resultsElement = document.createElement("div");
+                resultsElement.classList.add("results-container");
+                
+                msg.results.forEach(restaurant => {
+                    const restaurantElement = document.createElement("div");
+                    restaurantElement.classList.add("restaurant-result");
+                    
+                    let restaurantHTML = `
+                        <h3>${restaurant.name}</h3>
+                        <p><strong>Address:</strong> ${restaurant.address}</p>
+                        <p><strong>Stars:</strong> ${restaurant.stars}</p>
+                    `;
+                    
+                    // Add review if available
+                    if (restaurant.review) {
+                        restaurantHTML += `<p><strong>Recent Review:</strong> "${restaurant.review}"</p>`;
+                    }
+                    
+                    // Add image if available
+                    if (restaurant.image_url) {
+                        restaurantHTML += `<img src="${restaurant.image_url}" alt="${restaurant.name}" class="restaurant-img">`;
+                    }
+                    
+                    restaurantElement.innerHTML = restaurantHTML;
+                    resultsElement.appendChild(restaurantElement);
+                });
+                
+                messageElement.appendChild(resultsElement);
+            }
+            
             document.getElementById("chat-box").appendChild(messageElement);
             document.getElementById("chat-box").scrollTop = document.getElementById("chat-box").scrollHeight; // Scroll to bottom
         }
@@ -88,32 +186,137 @@
         function sendMessage() {
             const input = document.getElementById("chat-input");
             const message = input.value.trim();
-
-            if (message && !input.disabled) {
+            
+            // Check if we have text or an image to send
+            if ((message || currentImage) && !input.disabled) {
                 // Disable the input field to prevent multiple submissions
                 input.disabled = true;
 
                 // Add user message to chat history
-                const userMsg = { sender: 'user', text: message };
+                const userMsg = { 
+                    sender: 'user', 
+                    text: message || "Sent an image", 
+                    image: currentImage 
+                };
+                
                 chats[currentChatId].push(userMsg);
                 displayMessage(userMsg);
                 
-                // Clear the input field
+                // Clear the input field and image preview
                 input.value = "";
+                const hasImage = !!currentImage;
+                
+                // Show a thinking message
+                const thinkingMsg = { sender: 'bot', text: "Thinking..." };
+                const thinkingElement = document.createElement("div");
+                thinkingElement.classList.add('bot');
+                thinkingElement.innerHTML = `
+                    <img src="https://via.placeholder.com/50" class="bot-img" alt="Bot Image">
+                    <p>Thinking...</p>
+                `;
+                document.getElementById("chat-box").appendChild(thinkingElement);
+                document.getElementById("chat-box").scrollTop = document.getElementById("chat-box").scrollHeight;
 
-                // Generate bot response based on user input
-                let botMessage = "Didnt get that";
-                if (message.toLowerCase() === "hello") {
-                    botMessage = "hello how can I help you?";
+                if (hasImage) {
+                    // Send image to backend
+                    const formData = new FormData();
+                    
+                    // Convert base64 to blob
+                    const byteString = atob(currentImage.split(',')[1]);
+                    const mimeString = currentImage.split(',')[0].split(':')[1].split(';')[0];
+                    const ab = new ArrayBuffer(byteString.length);
+                    const ia = new Uint8Array(ab);
+                    for (let i = 0; i < byteString.length; i++) {
+                        ia[i] = byteString.charCodeAt(i);
+                    }
+                    const blob = new Blob([ab], {type: mimeString});
+                    
+                    formData.append('file', blob);
+                    
+                    fetch("/recommend/image", {
+                        method: "POST",
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        // Remove thinking message
+                        document.getElementById("chat-box").removeChild(thinkingElement);
+                        
+                        let responseText = "Here are some restaurants that match your image:";
+                        if (data.caption) {
+                            responseText = `I see ${data.caption}. Here are some similar restaurants:`;
+                        }
+                        
+                        const botMsg = { 
+                            sender: 'bot', 
+                            text: responseText,
+                            results: data.results 
+                        };
+                        chats[currentChatId].push(botMsg);
+                        displayMessage(botMsg);
+                        input.disabled = false; // Re-enable input
+                    })
+                    .catch(err => {
+                        // Remove thinking message
+                        document.getElementById("chat-box").removeChild(thinkingElement);
+                        
+                        console.error(err);
+                        const botMsg = { sender: 'bot', text: "Error processing your image. Please try again." };
+                        chats[currentChatId].push(botMsg);
+                        displayMessage(botMsg);
+                        input.disabled = false;
+                    });
+                    
+                    resetImagePreview();
+                } else {
+                    // Send text message to backend
+                    fetch("/recommend", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify({
+                            session_id: sessionId,
+                            user_input: message
+                        })
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        // Remove thinking message
+                        document.getElementById("chat-box").removeChild(thinkingElement);
+                        
+                        let botMsg;
+                        
+                        if (data.ask) {
+                            // The backend is asking for more information
+                            botMsg = { sender: 'bot', text: data.ask };
+                        } else if (data.results && data.results.length > 0) {
+                            // We have restaurant results
+                            botMsg = { 
+                                sender: 'bot', 
+                                text: "Here are some restaurants you might like:",
+                                results: data.results 
+                            };
+                        } else {
+                            // Generic response
+                            botMsg = { sender: 'bot', text: "I couldn't find any restaurants matching your criteria." };
+                        }
+                        
+                        chats[currentChatId].push(botMsg);
+                        displayMessage(botMsg);
+                        input.disabled = false; // Re-enable input
+                    })
+                    .catch(err => {
+                        // Remove thinking message
+                        document.getElementById("chat-box").removeChild(thinkingElement);
+                        
+                        console.error(err);
+                        const botMsg = { sender: 'bot', text: "Error contacting server. Please try again later." };
+                        chats[currentChatId].push(botMsg);
+                        displayMessage(botMsg);
+                        input.disabled = false;
+                    });
                 }
-
-                // Add bot response after a short delay
-                setTimeout(() => {
-                    const botMsg = { sender: 'bot', text: botMessage };
-                    chats[currentChatId].push(botMsg);
-                    displayMessage(botMsg);
-                    input.disabled = false; // Re-enable the input field after a response
-                }, 1000); // Simulate bot response delay
                 
                 updateChatHistory();
             }

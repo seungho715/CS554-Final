@@ -1,104 +1,157 @@
 import os
 import json
-import requests
-from io import BytesIO
-from collections import defaultdict
-
-import numpy as np
-import torch
 import faiss
+import boto3
+import torch
+
 from PIL import Image
-from transformers import (CLIPProcessor, CLIPModel)
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from transformers import CLIPModel, CLIPProcessor
 
-from imageCaptioner import *
+from etl_business import Photo, DATABASE_URL
+from image.businessSearch import businessIndexer
+from image.imageCaptioner import imageCaptioner
 
-from businessSearch import *
+# ─── S3 helper ─────────────────────────────────────────────────────────────
 
-def img_from_disk(path):
-    return Image.open(path).convert("RGB")
+s3 = boto3.client("s3")
+BUCKET = "cs554-yelp-photos"
 
-def img_from_url(url):
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    return Image.open(BytesIO(resp.content)).convert("RGB")
+def _load_from_s3(business_id: str, photo_id: str) -> Image.Image:
+    key = f"{business_id}/{photo_id}.jpg"
+    obj = s3.get_object(Bucket=BUCKET, Key=key)
+    return Image.open(obj["Body"]).convert("RGB")
 
-# Pipeline combining FAISS business search and image captioner+classifier together
-class imagePipeline:
-    def __init__(self, index_path=None, business_ids_path=None, model_name="openai/clip-vit-base-patch32"):
-        self.captioner = imageCaptioner()
-        self.searcher = None
+# ─── main pipeline ─────────────────────────────────────────────────────────
 
-        if index_path and business_ids_path:
-            self.load_index(index_path, business_ids_path, model_name)
-
-    def _load(self, src):
-        if isinstance(src, Image.Image):
-            return src
-        if isinstance(src, str) and src.startswith(("http://", "https://")):
-            return img_from_url(src)
-        if isinstance(src, str) and os.path.exists(src):
-            return img_from_disk(src)
-        raise ValueError(f"Cannot load image from {src}")
-
+class ImagePipeline:
+    S3_BUCKET = BUCKET
     @staticmethod
-    def make_faiss_index(json_path, image_dir, index_path, business_ids_path,
-                         batch_size=64, model_name="openai/clip-vit-base-patch32"):
-        idxr = businessIndexer(model_name=model_name)
-        idxr.build(json_path, image_dir, batch_size=batch_size)
-        idx, bids, *_ = idxr.get_index()
+    def build_index_from_db(
+        index_path:        str,
+        business_ids_path: str,
+        batch_size:        int = 64,
+        clip_model_name:   str = "openai/clip-vit-base-patch32"
+    ):
+        """
+        One‐off: Pull photo metadata from Postgres, images from S3, embed via CLIP,
+        build FAISS index (one vector per business), and write it to disk.
+        """
+        # DB session
+        engine  = create_engine(DATABASE_URL)
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        photos  = session.query(Photo).all()
 
-        faiss.write_index(idx, index_path)
-        with open(business_ids_path, 'w') as f:
-            json.dump(bids, f)
-        print(f"FAISS index → {index_path}")
-        print(f"Business IDs → {business_ids_path}")
+        # CLIP embedding setup
+        device    = "cuda" if torch.cuda.is_available() else "cpu"
+        clip      = CLIPModel.from_pretrained(clip_model_name).to(device)
+        processor = CLIPProcessor.from_pretrained(clip_model_name)
 
-    def load_index(self, index_path, business_ids_path, model_name):
+        # businessIndexer will average per-business
+        idxr      = businessIndexer(model_name=clip_model_name)
+
+        # batch & accumulate
+        for i in range(0, len(photos), batch_size):
+            batch = photos[i : i + batch_size]
+            imgs, bids = [], []
+            for p in batch:
+                try:
+                    img = _load_from_s3(p.business_id, p.photo_id)
+                except Exception as err:
+                    print(f"skipping corrupt image {p.photo_id}: {err}")
+                    continue
+                imgs.append(img)
+                bids.append(p.business_id)
+
+            if imgs:  
+                idxr.add_batch(imgs, bids)
+
+        # finalize & dump
+        index, business_list, *_ = idxr.get_index()
+        faiss.write_index(index, index_path)
+        with open(business_ids_path, "w") as f:
+            json.dump(business_list, f)
+
+        print(f"Built FAISS index → {index_path}")
+        print(f"Saved business IDs → {business_ids_path}")
+
+    def __init__(
+        self,
+        index_path:        str,
+        business_ids_path: str,
+        clip_model_name:   str = "openai/clip-vit-base-patch32"
+    ):
+        # 1) load vector index + business ordering
         self.index = faiss.read_index(index_path)
-        with open(business_ids_path, 'r') as f:
-            bids = json.load(f)
+        with open(business_ids_path, "r") as f:
+            self.bids = json.load(f)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = CLIPModel.from_pretrained(model_name).to(device)
-        processor = CLIPProcessor.from_pretrained(model_name)
-        self.searcher = businessSearch(self.index, bids, model, processor, device)
-        print(f"Loaded FAISS index (n_businesses={len(bids)})")
+        # 2) CLIP setup
+        device    = "cuda" if torch.cuda.is_available() else "cpu"
+        self.clip = CLIPModel.from_pretrained(clip_model_name).to(device)
+        self.proc = CLIPProcessor.from_pretrained(clip_model_name)
 
-    def caption(self, src) -> str:
-        img = self._load(src)
+        # 3) BLIP captioner
+        self.captioner = imageCaptioner()
+        self.S3_BUCKET = BUCKET
+
+    def caption(self, business_id: str, photo_id: str) -> str:
+        img = _load_from_s3(business_id, photo_id)
         return self.captioner.caption(img)
 
-    def search(self, src, top_k=5):
-        if not self.searcher:
-            raise ValueError("Index not loaded.")
-        img = self._load(src)
-        return self.searcher.query(img, top_k)
+    def search(self, business_id: str, photo_id: str, top_k: int = 5):
+        """
+        Given (business_id,photo_id) as S3 keys, return the top_k closest
+        businesses by CLIP similarity.
+        """
+        img    = _load_from_s3(business_id, photo_id)
+        inputs = self.proc(images=[img], return_tensors="pt").to(self.clip.device)
+        feat_tensor = self.clip.get_image_features(**inputs).cpu()
+        feat   = feat_tensor.detach().numpy()
+        D, I   = self.index.search(feat.astype("float32"), top_k)
 
-    def full_pipeline(self, src, top_k=5):
-        img = self._load(src)
+        return [(self.bids[i], float(D[0][j])) for j, i in enumerate(I[0])]
+
+    def full_pipeline(self, business_id: str, photo_id: str, top_k: int = 5):
         return {
-            "caption": self.captioner.caption(img),
-            "top_businesses": self.searcher.query(img, top_k)
+            "caption":       self.caption(business_id, photo_id),
+            "top_businesses": self.search(business_id, photo_id, top_k)
         }
+        
+    def caption_image(self, img: Image.Image) -> str:
+        """
+        Take a PIL image and return a BLIP caption string.
+        """
+        return self.captioner.caption(img)
 
-# For making the initial FAISS index
-if __name__ == "__main__":
+    def search_image(self, img: Image.Image, top_k: int = 5):
+        """
+        Take a PIL image and return top_k (business_id, score) from FAISS.
+        """
+        # 1) tokenize & embed
+        inputs = self.proc(images=[img], return_tensors="pt", padding=True).to(self.clip.device)
+        with torch.no_grad():
+            feats = self.clip.get_image_features(**inputs)
 
-    photo_json = "../Dataset/Yelp_Photos/photos.json"
-    photo_folder = "../Dataset/Yelp_Photos/photos"
+        # 2) move off GPU / strip grad
+        feats_np = feats.detach().cpu().numpy().astype("float32")
 
-    imagePipeline.make_faiss_index(photo_json, photo_folder, "business_index.faiss", "business_ids.json")
+        # 3) query FAISS
+        D, I = self.index.search(feats_np, top_k)
 
-    '''
-    pipeline = imagePipeline(
-        index_path="business_index.faiss",
-        business_ids_path="business_ids.json"
-    )
+        # 4) map back to business IDs
+        return [
+            (self.bids[i], float(D[0][j]))
+            for j, i in enumerate(I[0])
+        ]
 
-    while True:
-        inp = input("Enter URL or file path: ")
-        out = pipeline.full_pipeline(inp)
-        print("Caption:       ", out["caption"])
-        print("Top Businesses:", out["top_businesses"])
-        print()
-    '''
+    def full_pipeline_image(self, img: Image.Image, top_k: int = 5):
+        """
+        Combined caption + visual search
+        """
+        return {
+            "caption":       self.caption_image(img),
+            "top_businesses": self.search_image(img, top_k)
+        }
